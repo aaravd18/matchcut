@@ -1,0 +1,4 @@
+opencv-python
+numpy
+matplotlib
+# also requires ffmpeg + ffprobe on PATH (e.g. brew install ffmpeg)
