@@ -1,6 +1,9 @@
 """Stage 6 — render videos with ffmpeg (hard cuts, no audio).
 
-- outputs/montage/montage.mp4: every segment of the EDL joined with hard cuts.
+- outputs/montage/montage.mp4: every segment of the EDL joined with hard cuts,
+  with the soundtrack (from the EDL's music start, faded out at the end) when
+  the montage was cut to music. --click also writes montage_click.mp4 with a
+  metronome on the detected beats, to check the sync by ear.
 - outputs/comparisons/rankNN__<A>__<B>.mp4: previews for the top h4 pairs.
   Each preview uses the better cut direction (A->B or B->A) and the best cut
   points from the transition scores, with `seconds_a` before the cut and
@@ -11,32 +14,82 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
+
+import numpy as np
 
 from .config import OutputPaths, RenderConfig, SequenceConfig
 from .similarity import short_names
 from .transitions import breakdown, best_cut, load_features
 
 
-def concat_segments(segments: Sequence[tuple[str, int, int]], out_path: Path, fps: float, crf: int = 18) -> None:
-    """Join [start_frame, end_frame) ranges of (identically formatted) videos with hard cuts."""
+def concat_segments(segments: Sequence[tuple[str, int, int]], out_path: Path, fps: float, crf: int = 18,
+                    audio: Optional[dict] = None) -> None:
+    """Join [start_frame, end_frame) ranges of (identically formatted) videos with hard cuts.
+
+    audio (optional): {"path", "start", "duration", "fade", "click_wav"} — music
+    from `start` seconds for `duration` seconds, faded out over the last `fade`
+    seconds, optionally mixed with a click track.
+    """
     inputs, graph = [], []
     for i, (path, start, end) in enumerate(segments):
         inputs += ["-i", str(path)]
         graph.append(f"[{i}:v]trim=start_frame={start}:end_frame={end},setpts=PTS-STARTPTS[v{i}]")
     graph.append("".join(f"[v{i}]" for i in range(len(segments))) + f"concat=n={len(segments)}:v=1:a=0[out]")
+    maps = ["-map", "[out]"]
+    if audio:
+        a = len(segments)
+        dur, fade = audio["duration"], min(audio["fade"], audio["duration"])
+        inputs += ["-ss", f"{audio['start']:.4f}", "-t", f"{dur:.4f}", "-i", str(audio["path"])]
+        music = f"[{a}:a]aformat=sample_rates=44100:channel_layouts=stereo,afade=t=out:st={dur - fade:.3f}:d={fade:.3f}"
+        if audio.get("click_wav"):
+            inputs += ["-i", str(audio["click_wav"])]
+            graph.append(music + "[m]")
+            graph.append(f"[{a + 1}:a]aformat=sample_rates=44100:channel_layouts=stereo[c]")
+            graph.append("[m][c]amix=inputs=2:normalize=0:duration=first[aout]")
+        else:
+            graph.append(music + "[aout]")
+        maps += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
     cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", ";".join(graph),
-           "-map", "[out]", "-r", str(fps), "-c:v", "libx264", "-crf", str(crf),
+           *maps, "-r", str(fps), "-c:v", "libx264", "-crf", str(crf),
            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path)]
     subprocess.run(cmd, check=True)
 
 
-def run_montage(manifest: dict, edl: dict, paths: OutputPaths, crf: int = 18) -> Path:
-    fps = manifest["clips"][0]["fps"]
+def write_click_track(beat_times: Sequence[float], is_down: Sequence[bool], duration: float, path: Path,
+                      sr: int = 44100) -> None:
+    """Metronome: 1 kHz tick on every beat, louder 2 kHz tick on downbeats."""
+    import librosa
+    import soundfile as sf
+
+    n = int(round(duration * sr))
+    bt = np.asarray(beat_times, float)
+    down = np.asarray(is_down, bool)
+    y = 0.35 * librosa.clicks(times=bt[~down], sr=sr, click_freq=1000, click_duration=0.05, length=n)
+    y += 0.6 * librosa.clicks(times=bt[down], sr=sr, click_freq=2000, click_duration=0.07, length=n)
+    sf.write(str(path), y.astype(np.float32), sr)
+
+
+def run_montage(manifest: dict, edl: dict, paths: OutputPaths, crf: int = 18, click: bool = False) -> Path:
+    fps = edl.get("fps", manifest["clips"][0]["fps"])
     segs = [(s["path"], s["in_frame"], s["out_frame"]) for s in edl["segments"]]
     out = paths.montage / "montage.mp4"
-    concat_segments(segs, out, fps, crf)
-    print(f"[render] montage: {len(segs)} clips, {edl['total_duration']:.1f}s -> {out}")
+    stale_click = paths.montage / "montage_click.mp4"
+    mu = edl.get("music")
+    audio = None
+    if mu:
+        audio = {"path": mu["path"], "start": mu["start"], "duration": edl["total_duration"],
+                 "fade": mu["config"]["fade"]}
+    concat_segments(segs, out, fps, crf, audio)
+    print(f"[render] montage: {len(segs)} clips, {edl['total_duration']:.1f}s"
+          + (f", music {mu['start']:.2f}–{mu['end']:.2f}s" if mu else ", no audio") + f" -> {out}")
+    if click and mu:
+        wav = paths.montage / "clicks.wav"
+        write_click_track(mu["beat_times"], mu["is_downbeat"], edl["total_duration"], wav)
+        concat_segments(segs, stale_click, fps, crf, {**audio, "click_wav": wav})
+        print(f"[render] click-track check: {stale_click}")
+    elif stale_click.exists():
+        stale_click.unlink()
     return out
 
 

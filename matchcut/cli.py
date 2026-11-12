@@ -7,9 +7,10 @@
     python -m matchcut motion                    # 2  h4 mean flow + flow time series
     python -m matchcut similarity                # 3  h4 pairwise ranking (+ minimum-motion filter)
     python -m matchcut transitions               # 4  score candidate cut points
-    python -m matchcut sequence --max-clips all  # 5  order clips + place cuts -> EDL
-    python -m matchcut render                    # 6  montage.mp4 + h4 pair previews
-    python -m matchcut report                    # 7  HTML report
+    python -m matchcut beats                     # 5  tempo / beats / downbeats of data/music/*
+    python -m matchcut sequence --max-clips all  # 6  order clips + place cuts on the beat -> EDL
+    python -m matchcut render --click            # 7  montage.mp4 with music (+ metronome check)
+    python -m matchcut report                    # 8  HTML report
 
 Each stage reads the previous stages' files from --out, so any stage can be
 re-run on its own (e.g. `sequence` then `render` then `report` to try a
@@ -21,7 +22,7 @@ import argparse
 import time
 from pathlib import Path
 
-from .config import FlowConfig, OutputPaths, PreprocessConfig, RenderConfig, SequenceConfig
+from .config import FlowConfig, MusicConfig, OutputPaths, PreprocessConfig, RenderConfig, SequenceConfig
 
 
 def _max_clips(value: str):
@@ -69,6 +70,24 @@ def _add_sequence_args(p):
                    help="cut score weights (default: %(default)s)")
 
 
+def _add_music_args(p):
+    g = p.add_argument_group("music")
+    g.add_argument("--no-music", action="store_true", help="ignore data/music: free timing, silent montage")
+    g.add_argument("--music", type=str, default=None, help="soundtrack file (default: first file in <input>/music)")
+    if "--input" not in p._option_string_actions:
+        p.add_argument("--input", type=Path, default=Path("data"), help="folder whose music/ subfolder holds the soundtrack")
+    g.add_argument("--bpm", type=float, default=None, help="force the tempo instead of estimating it")
+    g.add_argument("--downbeat-offset", type=int, choices=[0, 1, 2, 3], default=None,
+                   help="force which detected beat (mod 4) is beat 1 of a bar")
+    g.add_argument("--music-start", type=float, default=MusicConfig.start,
+                   help="start the montage at the first downbeat at/after this music time (s)")
+    g.add_argument("--cut-on", choices=["beats", "bars"], default=MusicConfig.cut_on,
+                   help="cut on any beat (lengths vary) or only on bar lines")
+    g.add_argument("--w-beat", type=float, default=MusicConfig.w_beat,
+                   help="reward for cutting on a strong beat / downbeat (default: %(default)s)")
+    g.add_argument("--click", action="store_true", help="also render montage_click.mp4 with a metronome on the beats")
+
+
 def _add_render_args(p):
     g = p.add_argument_group("render (h4 pair previews)")
     g.add_argument("--top-n", type=int, default=RenderConfig.top_n, help="previews to render")
@@ -83,13 +102,17 @@ def _add_report_args(p):
 
 STAGES = {
     "run": ("run every stage in order",
-            [_add_preprocess_args, _add_motion_args, _add_min_motion, _add_sequence_args, _add_render_args, _add_report_args]),
+            [_add_preprocess_args, _add_motion_args, _add_min_motion, _add_sequence_args, _add_music_args,
+             _add_render_args, _add_report_args]),
     "preprocess": ("standardize raw clips (640x360, 30 fps, <= 20 s)", [_add_preprocess_args]),
     "motion": ("h4 mean flow + pooled flow time series", [_add_motion_args]),
     "similarity": ("h4 cosine matrix and ranked pairs", [_add_min_motion]),
     "transitions": ("score candidate cut points between clips", [_add_min_motion, _add_sequence_args]),
-    "sequence": ("choose clip order and cut points (EDL)", [_add_min_motion, _add_sequence_args]),
-    "render": ("render montage.mp4 and h4 pair previews", [_add_min_motion, _add_sequence_args, _add_render_args]),
+    "beats": ("detect tempo, beats and downbeats of the soundtrack (librosa)", [_add_music_args]),
+    "sequence": ("choose clip order and cut points (EDL), on the beat if music was analysed",
+                 [_add_min_motion, _add_sequence_args, _add_music_args]),
+    "render": ("render montage.mp4 (+ music) and h4 pair previews",
+               [_add_min_motion, _add_sequence_args, _add_music_args, _add_render_args]),
     "report": ("HTML report", [_add_report_args]),
 }
 
@@ -110,6 +133,12 @@ def _seq_cfg(args) -> SequenceConfig:
     return SequenceConfig(min_motion=args.min_motion, max_clips=args.max_clips, order=args.order,
                           seg_min=args.seg_min, seg_max=args.seg_max, seg_target=args.seg_target,
                           w_motion=wm, w_comp=wc, w_color=wcol)
+
+
+def _music_cfg(args) -> MusicConfig:
+    return MusicConfig(enabled=not args.no_music, path=args.music, bpm=args.bpm,
+                       downbeat_offset=args.downbeat_offset, start=args.music_start,
+                       cut_on=args.cut_on, w_beat=args.w_beat)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -133,9 +162,12 @@ def main(argv: list[str] | None = None) -> None:
     if stage in ("run", "transitions"):
         from .transitions import run_transitions
         run_transitions(load_manifest(paths), paths, _seq_cfg(args))
+    if stage in ("run", "beats"):
+        from .audio import run_beats
+        run_beats(args.input, paths, _music_cfg(args))
     if stage in ("run", "sequence"):
         from .sequence import run_sequence
-        run_sequence(load_manifest(paths), paths, _seq_cfg(args))
+        run_sequence(load_manifest(paths), paths, _seq_cfg(args), _music_cfg(args))
     if stage in ("run", "render"):
         from .render import run_montage, run_previews
         from .sequence import load_edl
@@ -143,7 +175,7 @@ def main(argv: list[str] | None = None) -> None:
         edl = load_edl(paths)
         if edl is None:
             raise SystemExit(f"{paths.edl} not found — run the 'sequence' stage first")
-        run_montage(manifest, edl, paths)
+        run_montage(manifest, edl, paths, click=args.click)
         run_previews(manifest, load_ranked(paths), paths,
                      RenderConfig(top_n=args.top_n, seconds_a=args.seconds_a, seconds_b=args.seconds_b), _seq_cfg(args))
     if stage in ("run", "report"):

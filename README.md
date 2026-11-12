@@ -1,19 +1,22 @@
 # CS180 Final Project — motion match-cut montage
 
-Takes a folder of clips and produces **one montage video** in which each clip
-cuts into the next on matching motion, composition and colour. It starts from
-heuristic **h4** in Chen et al., *Match Cutting: Finding Cuts with Smooth
-Visual Transitions* (WACV 2023, Sec. 3.3), and extends it to choose cut points,
-clip order and segment lengths.
+Takes a folder of clips plus a soundtrack and produces **one music video** in
+which each clip cuts into the next on matching motion, composition and colour,
+with every cut on the beat. It starts from heuristic **h4** in Chen et al.,
+*Match Cutting: Finding Cuts with Smooth Visual Transitions* (WACV 2023,
+Sec. 3.3), and extends it to choose cut points, clip order and segment lengths.
 
-Not yet: music / beat sync, transitions other than hard cuts, a frontend.
+Not yet: transitions other than hard cuts, reusing clips to fill a whole song, a frontend.
 
 ## Run
 
 ```bash
-conda activate cs180          # opencv-python, numpy, matplotlib; ffmpeg/ffprobe on PATH
-python -m matchcut run        # data/  ->  outputs/montage/montage.mp4 + outputs/report/index.html
+conda activate cs180          # opencv-python, numpy, matplotlib, librosa; ffmpeg/ffprobe on PATH
+python -m matchcut run        # data/*.mp4 + data/music/*  ->  outputs/montage/montage.mp4 + outputs/report/index.html
 ```
+
+Put clips directly in `data/` and the soundtrack in `data/music/`; the first
+audio file there is used, or choose one with `--music`.
 
 Useful options (`python -m matchcut run -h` for all):
 
@@ -24,11 +27,17 @@ Useful options (`python -m matchcut run -h` for all):
 | `--seg-min 1.5 --seg-max 3.5 --seg-target 2.5` | seconds each clip stays on screen |
 | `--weights 0.6 0.25 0.15` | cut score weights: motion, composition, colour |
 | `--min-motion 0.05` | px/frame below which a clip/window counts as static |
+| `--w-beat 0.05` | how strongly cuts prefer bar lines. 0.05 gives varied lengths with most cuts on bar lines; ≥ 0.1 gives one cut per bar |
+| `--cut-on beats` / `--cut-on bars` | allow cuts on any beat, or only on bar lines |
+| `--music-start 60` | start the montage at the first bar line after 60 s of the song |
+| `--click` | also render `montage_click.mp4` with a metronome, to check the sync by ear |
+| `--bpm 120`, `--downbeat-offset 0-3` | override the tempo or bar-line detection if they're wrong |
+| `--no-music` | free timing, silent video |
 
-To try a different montage without recomputing optical flow, re-run only the last stages:
+To try a different montage without recomputing optical flow or beats, re-run only the last stages:
 
 ```bash
-python -m matchcut sequence --max-clips 4 && python -m matchcut render && python -m matchcut report
+python -m matchcut sequence --max-clips 8 --w-beat 0.2 && python -m matchcut render --click && python -m matchcut report
 ```
 
 Tests (synthetic clips, no data needed; run with or without pytest):
@@ -36,6 +45,7 @@ Tests (synthetic clips, no data needed; run with or without pytest):
 ```bash
 python tests/test_synthetic.py    # h4: pans, tilts, zooms, moving objects, static
 python tests/test_sequence.py     # cut scoring, ordering, max-clips, segment limits
+python tests/test_beats.py        # tempo/beats/downbeats on a generated track; cuts exactly on beats
 ```
 
 ## Pipeline
@@ -46,9 +56,26 @@ python tests/test_sequence.py     # cut scoring, ordering, max-clips, segment li
 | 2 | motion | `motion.py` | h4 mean flow, plus a flow time series (adjacent-frame flow every 2 frames, pooled to 16×9) | `motion/<id>.npz`, `<id>_flow.jpg`, `summary.csv` |
 | 3 | similarity | `similarity.py` | h4 cosine matrix; ranking with the **minimum-motion filter** | `similarity/matrix.*`, `heatmap.png`, `ranked_pairs.*` |
 | 4 | transitions | `transitions.py` | features at every candidate cut point (every 0.25 s); best directed cut for every pair | `transitions/<id>.npz`, `edges.{csv,json}`, `edges_heatmap.png` |
-| 5 | sequence | `sequence.py` | clip order + exact cut points → edit decision list | `montage/edl.{json,csv}` |
-| 6 | render | `render.py` | the montage, plus previews of the top-5 h4 pairs | `montage/montage.mp4`, `comparisons/*.mp4` |
-| 7 | report | `report.py` | HTML: montage + per-cut breakdown, h4 analysis, clips | `report/index.html` |
+| 5 | beats | `audio.py` | librosa: tempo, beats, bar lines of the soundtrack | `beats/beats.json`, `beats.png` |
+| 6 | sequence | `sequence.py` | clip order + exact cut points on the beat → edit decision list | `montage/edl.{json,csv}` |
+| 7 | render | `render.py` | the montage with music, plus previews of the top-5 h4 pairs | `montage/montage.mp4` (+ `montage_click.mp4`), `comparisons/*.mp4` |
+| 8 | report | `report.py` | HTML: montage, beat timeline, per-cut breakdown, h4 analysis, clips | `report/index.html` |
+
+## Beat sync
+
+1. **Analysis (`audio.py`, librosa):**
+   - The music is decoded with ffmpeg.
+   - `onset_strength` gives an onset envelope; `beat.beat_track` (Ellis's dynamic programming, with a tempo prior near 120 BPM) gives the beats.
+   - Bar lines assume 4/4: of the 4 possible bar positions, pick the one with the most kick-drum energy, chord changes and section-start loudness jumps.
+   - librosa skips leading beats with no percussion, so the grid starts where the drums do (18.09 s in the current track).
+2. **Placement (`sequence.py`, `place_segments_on_beats`):** dynamic programming over (beat a clip ends on, its out-point).
+   - Every clip lasts a whole number of beats within `seg_min`–`seg_max` (4–7 beats at 120 BPM).
+   - Every cut sits on a beat frame (≤ 17 ms rounding).
+   - The montage ends on a bar line.
+   - Objective = Σ cut scores + `w_beat` × beat reward − length penalty. The beat reward is set by position in the bar: bar line 1.0, beat 3 0.6, beats 2 and 4 0.25, each × (0.5 + 0.5 × onset strength). Position matters because in most pop the snare on 2 and 4 is louder than beat 1, so onset strength alone would not favour bar lines.
+3. **Render:** the music starts at the montage's first bar line, is trimmed to the video length, and fades out over the last 1.5 s.
+
+**Verified on the rendered file:** beat-tracking the final montage's own audio puts all 11 cuts (detected from the video) within ±7 ms of a beat.
 
 ## How a cut is scored (departs from the paper)
 
@@ -118,4 +145,5 @@ not the code, so these details are our choices:
   can only get weak cuts. See `data/README.md` for what to download.
 - Flow is position-sensitive (a 16×9 grid for cuts, per pixel for h4), and
   camera motion dominates over subject motion.
-- There are no audio, music or beat constraints yet; segment lengths are free within limits.
+- Beat sync assumes 4/4 and a steady tempo; the bar-line choice is a heuristic (check with `--click`, fix with `--downbeat-offset`).
+- The montage covers about 30 s of the song; filling a whole song would need clips reused.

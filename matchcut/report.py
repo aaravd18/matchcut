@@ -94,21 +94,48 @@ def _score_row(t: dict, w: dict) -> str:
             f"<div><dt>speed out / in</dt><dd>{t['out_speed']:.2f} / {t['in_speed']:.2f} px/f</dd></div></dl>")
 
 
-def _montage_section(edl: dict) -> str:
+def _music_html(edl: dict, paths: OutputPaths) -> str:
+    mu = edl.get("music")
+    if not mu:
+        return '<p class="note">No soundtrack: free timing, silent video (add a file to data/music/ to cut on the beat).</p>'
+    total = edl["total_duration"]
+    ticks = "".join(
+        f'<i class="{"down" if d else ""}" style="left:{100 * t / total:.3f}%"></i>'
+        for t, d in zip(mu["beat_times"], mu["is_downbeat"]))
+    cfg = mu["config"]
+    click = ('<a href="../montage/montage_click.mp4">montage_click.mp4</a> (metronome on the detected beats; '
+             'louder tick = bar line)' if (paths.montage / "montage_click.mp4").exists()
+             else "render with <code>--click</code> for a metronome version to check the sync by ear")
+    return f"""
+<div class="beats">{ticks}</div>
+<p class="note">Beat ticks under the timeline (tall = bar line). Music: <b>{esc(Path(mu['path']).name)}</b>,
+{mu['tempo']:.1f} BPM, playing {mu['start']:.2f}–{mu['end']:.2f}s of the track. Clips last {', '.join(map(str, mu['allowed_beats']))} beats
+(cut on: {esc(cfg['cut_on'])}, beat weight {cfg['w_beat']}); {mu['cuts_on_downbeats']}/{len(edl['cuts'])} cuts on bar lines;
+ends on a bar line: {'yes' if mu['ends_on_downbeat'] else 'no'}. Check: {click}.</p>
+<figure class="wide"><img loading="lazy" src="../beats/beats.png" alt="onset strength with detected beats and downbeats">
+<figcaption>Beat analysis of the whole track (librosa onset strength; red = bar lines in the zoom)</figcaption></figure>"""
+
+
+def _montage_section(edl: dict, paths: OutputPaths) -> str:
     cfg = edl["config"]
     total = edl["total_duration"]
     timeline = "".join(
         f'<div class="seg" style="flex:{s["duration"]}" title="{esc(s["clip_id"])}: {s["in_s"]:.2f}–{s["out_s"]:.2f}s">'
-        f'<b>{s["index"]}</b> {esc(s["short_name"])}<span>{s["duration"]:.1f}s</span></div>'
+        f'<b>{s["index"]}</b> {esc(s["short_name"])}<span>{s["duration"]:.1f}s'
+        + (f' · {s["beats"]}♩' if "beats" in s else "") + '</span></div>'
         for s in edl["segments"])
     cards = []
     for c in edl["cuts"]:
         k = c["index"]
         fs, ts = esc(c["from_short"]), esc(c["to_short"])
+        beat = ""
+        if "beat" in c:
+            beat = (f' · beat {c["beat"]} '
+                    + ('<span class="chip">bar line</span>' if c["downbeat"] else f'(beat {c["beat"] % 4 + 1} of the bar)'))
         cards.append(f"""
 <article class="pair">
   <header><span class="rank">Cut {k}</span><span class="names">{fs} <span class="arrow">→</span> {ts}
-  <span class="dim">at {c['montage_time']:.2f}s</span></span><span class="score">{c['total']:+.3f}</span></header>
+  <span class="dim">at {c['montage_time']:.2f}s{beat}</span></span><span class="score">{c['total']:+.3f}</span></header>
   <div class="grid">
     {_fig(f"img/cut{k:02d}_out.jpg", f"last frame of {fs}", f"{fs} · last frame before the cut")}
     {_fig(f"img/cut{k:02d}_in.jpg", f"first frame of {ts}", f"{ts} · first frame after the cut")}
@@ -128,6 +155,7 @@ def _montage_section(edl: dict) -> str:
 · segments {cfg['seg_min']}–{cfg['seg_max']}s (target {cfg['seg_target']}s)</p>
 <video controls playsinline preload="metadata" src="../montage/montage.mp4"></video>
 <div class="timeline">{timeline}</div>
+{_music_html(edl, paths)}
 {''.join(f'<p class="note">{n}</p>' for n in notes)}
 <p class="note">Edit decision list: <a href="../montage/edl.csv">edl.csv</a> · <a href="../montage/edl.json">edl.json</a>.
 Best possible cut for every ordered pair: <a href="../transitions/edges.csv">edges.csv</a> · <a href="../transitions/edges_heatmap.png">edges_heatmap.png</a>.</p>
@@ -202,6 +230,11 @@ figcaption { font-size:12px; margin-top:3px; }
 .matrix th { font-weight:600; color:var(--muted); padding:4px 6px; white-space:nowrap; }
 .matrix td { width:58px; height:34px; text-align:center; border-radius:4px; }
 .scroll { overflow-x:auto; }
+.beats { position:relative; height:12px; margin:0 0 6px; border-bottom:1px solid var(--line); }
+.beats i { position:absolute; bottom:0; width:1px; height:5px; background:var(--muted); }
+.beats i.down { height:12px; width:2px; background:var(--accent); }
+.chip { font-size:11px; padding:1px 6px; border-radius:8px; background:var(--accent); color:#fff; }
+figure.wide { margin-top:10px; } figure.wide img { background:#fff; }
 .legend { display:flex; gap:14px; align-items:center; } .legend img { width:72px; background:transparent; }
 ul { padding-left:20px; }
 @media (max-width:600px) { .grid { grid-template-columns:1fr; } }
@@ -227,7 +260,7 @@ def run_report(manifest: dict, ranked: dict, paths: OutputPaths, top_k: int = 10
     if edl:
         feats = {f.clip_id: f for f in load_features(manifest, paths)}
         _cut_images(manifest, edl, feats, (flow_cfg["grid_w"], flow_cfg["grid_h"]), img_dir)
-        montage_html = _montage_section(edl)
+        montage_html = _montage_section(edl, paths)
 
     sim = np.load(paths.similarity / "matrix.npy")
     pairs = ranked["pairs"]
@@ -280,6 +313,7 @@ def run_report(manifest: dict, ranked: dict, paths: OutputPaths, top_k: int = 10
 <h2>How to read the flow panels</h2>
 <div class="legend"><img src="img/wheel.png" alt="flow colour wheel"><p class="note">Colour = direction pixels move, brightness = speed (each panel scaled to its own range; captions give absolute speed in px/frame at {flow_cfg['flow_width']}×{flow_cfg['flow_height']}). Arrows show local average flow. Flow describes how <i>image content</i> moves: a camera panning right makes content move left.</p></div>
 <ul class="note">
+<li><b>Beat sync</b>: with a soundtrack, each clip lasts a whole number of beats and every cut lands on a beat (to the nearest frame, ≤17 ms). Cuts earn a bonus by position in the bar (bar line 1.0, beat 3 0.6, beats 2/4 0.25) × beat weight.</li>
 <li><b>Cut score</b> = w_motion·motion + w_comp·composition + w_color·colour. Motion = cosine of the pooled flow just before vs just after the cut × speed ratio; it counts as 0 when either side barely moves. Composition = similarity of brightness and edge layout of the two frames at the cut. Colour = Lab histogram overlap.</li>
 <li>h4 is position-sensitive and dominated by camera motion (paper, Sec. 6); speed-blind (fixed in the cut score by the speed ratio).</li>
 </ul>

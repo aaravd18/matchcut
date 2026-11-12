@@ -1,4 +1,5 @@
 opencv-python
 numpy
 matplotlib
+librosa      # beat tracking (brings soundfile, numba, scikit-learn)
 # also requires ffmpeg + ffprobe on PATH (e.g. brew install ffmpeg)

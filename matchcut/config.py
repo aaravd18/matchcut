@@ -49,7 +49,7 @@ class SequenceConfig:
     """Montage: cut-point scoring, clip ordering and segment placement."""
     min_motion: float = 0.05      # px/frame (at flow resolution) below which motion is treated as absent
     window: float = 0.5           # seconds of flow compared on each side of a cut
-    cut_step: float = 0.25        # spacing of candidate cut points (seconds)
+    cut_step: float = 0.1         # spacing of candidate cut points inside each clip (seconds)
     seg_min: float = 1.5          # allowed length of each clip in the montage (seconds)
     seg_max: float = 3.5
     seg_target: float = 2.5
@@ -59,6 +59,25 @@ class SequenceConfig:
     w_color: float = 0.15
     max_clips: Optional[int] = None   # None = use every usable clip; N = best-connected N clips
     order: Optional[list] = None      # fixed clip order (ids or short names); skips the search
+
+
+@dataclass
+class MusicConfig:
+    """Soundtrack analysis (librosa) and beat-synchronised cutting."""
+    enabled: bool = True              # False = free timing, silent montage (previous behaviour)
+    path: Optional[str] = None        # None = first audio file in <input>/music
+    sr: int = 22050                   # analysis sample rate
+    hop_length: int = 256             # onset envelope hop (11.6 ms at 22.05 kHz)
+    start_bpm: float = 120.0          # tempo prior centre for librosa's beat tracker
+    bpm: Optional[float] = None       # force a tempo instead of estimating it
+    downbeat_offset: Optional[int] = None  # force which beat (0-3) is beat 1 of a bar
+    start: float = 0.0                # montage starts at the first downbeat at/after this music time (s)
+    cut_on: str = "beats"             # "beats": any beat (lengths vary) | "bars": bar lines only
+    w_beat: float = 0.05              # weight of the per-cut beat reward (bar line 1.0, beat 3 0.6, beats 2/4 0.25,
+                                      # each scaled by 0.5 + 0.5 * onset strength). Visual scores change little
+                                      # between nearby cut moments, so this is a strong knob: 0.05 gives varied
+                                      # lengths with most cuts on bar lines; >= 0.1 cuts on every bar line.
+    fade: float = 1.5                 # audio fade-out at the end (s)
 
 
 @dataclass
@@ -97,6 +116,14 @@ class OutputPaths:
     @property
     def transitions(self) -> Path:
         return self.root / "transitions"
+
+    @property
+    def beats(self) -> Path:
+        return self.root / "beats"
+
+    @property
+    def beats_json(self) -> Path:
+        return self.beats / "beats.json"
 
     @property
     def montage(self) -> Path:
